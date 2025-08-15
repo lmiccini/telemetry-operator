@@ -668,7 +668,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	// - %-config configmap holding minimal ceilometer config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateServiceConfig(ctx, helper, instance, transportURL, &configMapVars)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -685,7 +685,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	// - %-config configmap holding minimal ceilometer-compute config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateComputeServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateComputeServiceConfig(ctx, helper, instance, transportURL, &configMapVars)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -1189,6 +1189,7 @@ func (r *CeilometerReconciler) generateServiceConfig(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *telemetryv1.Ceilometer,
+	transportURL *rabbitmqv1.TransportURL,
 	envVars *map[string]env.Setter,
 ) error {
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(ceilometer.ServiceName), map[string]string{})
@@ -1224,6 +1225,7 @@ func (r *CeilometerReconciler) generateServiceConfig(
 		"TLS":                 false, // Default to false. Change to true later if TLS enabled
 		"SwiftRole":           false, //
 		"Timeout":             instance.Spec.APITimeout,
+		"QuorumQueues":        transportURL.GetQuorumQueues(),
 	}
 
 	// create httpd  vhost template parameters
@@ -1274,6 +1276,7 @@ func (r *CeilometerReconciler) generateComputeServiceConfig(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *telemetryv1.Ceilometer,
+	transportURL *rabbitmqv1.TransportURL,
 	envVars *map[string]env.Setter,
 ) error {
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(ceilometer.ComputeServiceName), map[string]string{})
@@ -1310,6 +1313,7 @@ func (r *CeilometerReconciler) generateComputeServiceConfig(
 		"ceilometer_compute_image": instance.Spec.ComputeImage,
 		"ceilometer_ipmi_image":    instance.Spec.IpmiImage,
 		"TLS":                      false,
+		"QuorumQueues":             transportURL.GetQuorumQueues(),
 	}
 
 	if instance.Spec.TLS.Enabled() {

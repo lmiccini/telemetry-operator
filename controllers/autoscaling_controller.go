@@ -512,7 +512,7 @@ func (r *AutoscalingReconciler) reconcileNormal(
 	// - %-scripts configmap holding scripts to e.g. bootstrap the service
 	// - %-config configmap holding minimal autoscaling config required to get the service up, user can add additional files to be added to the service
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars, memcached, db)
+	err = r.generateServiceConfig(ctx, helper, instance, transportURL, &configMapVars, memcached, db)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -592,6 +592,7 @@ func (r *AutoscalingReconciler) generateServiceConfig(
 	ctx context.Context,
 	h *helper.Helper,
 	instance *telemetryv1.Autoscaling,
+	transportURL *rabbitmqv1.TransportURL,
 	envVars *map[string]env.Setter,
 	mc *memcachedv1.Memcached,
 	db *mariadbv1.Database,
@@ -646,7 +647,8 @@ func (r *AutoscalingReconciler) generateServiceConfig(
 			string(databaseSecret.Data[mariadbv1.DatabasePasswordSelector]),
 			instance.Status.DatabaseHostname,
 			autoscaling.DatabaseName),
-		"Timeout": instance.Spec.Aodh.APITimeout,
+		"Timeout":      instance.Spec.Aodh.APITimeout,
+		"QuorumQueues": transportURL.GetQuorumQueues(),
 	}
 
 	prometheusParams := map[string]interface{}{
