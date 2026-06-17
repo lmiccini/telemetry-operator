@@ -527,6 +527,11 @@ func (r *CloudKittyReconciler) reconcileDelete(ctx context.Context, instance *te
 		}
 	}
 
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' delete successfully", instance.Name))
@@ -881,9 +886,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
 	}
 
-	instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-	if instance.Status.TransportURLSecret == "" {
+	if transportURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.RabbitMqTransportURLReadyCondition,
@@ -891,6 +894,14 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			condition.SeverityInfo,
 			condition.RabbitMqTransportURLReadyRunningMessage))
 		return cloudkitty.ResultRequeue, nil
+	}
+
+	if err := rabbitmqv1.ManageTransportSecretFinalizer(
+		ctx, helper, instance.Namespace,
+		transportURL.Status.SecretName,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	instance.Status.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, condition.RabbitMqTransportURLReadyMessage)
@@ -1001,7 +1012,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	//
 	// Create Secrets required as input for the Service and calculate an overall hash of hashes
 	//
-	err = r.generateServiceConfigs(ctx, helper, instance, &configVars, serviceLabels, memcached, db)
+	err = r.generateServiceConfigs(ctx, helper, instance, &configVars, serviceLabels, memcached, db, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -1113,7 +1124,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	//
 
 	// deploy cloudkitty-api
-	cloudKittyAPI, op, err := r.apiDeploymentCreateOrUpdate(ctx, instance)
+	cloudKittyAPI, op, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyAPIReadyCondition,
@@ -1126,8 +1137,6 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("API CR for %s successfully %s", instance.Name, string(op)))
 	}
-
-	// Mirror values when the data in the StatefulSet is for the current generation
 	if cloudKittyAPI.Generation == cloudKittyAPI.Status.ObservedGeneration {
 		// Mirror CloudKittyAPI status' APIEndpoints and ReadyCount to this parent CR
 		instance.Status.APIEndpoints = cloudKittyAPI.Status.APIEndpoints
@@ -1139,10 +1148,16 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		if c != nil {
 			instance.Status.Conditions.Set(c)
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.CloudKittyAPIReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy CloudKitty Processor
-	cloudKittyProc, op, err := r.procDeploymentCreateOrUpdate(ctx, instance)
+	cloudKittyProc, op, err := r.procDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyProcReadyCondition,
@@ -1155,8 +1170,6 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	if op != controllerutil.OperationResultNone {
 		Log.Info(fmt.Sprintf("Scheduler CR for %s successfully %s", instance.Name, string(op)))
 	}
-
-	// Mirror values when the data in the StatefulSet is for the current generation
 	if cloudKittyProc.Generation == cloudKittyProc.Status.ObservedGeneration {
 		// Mirror CloudKitty Processor status' ReadyCount to this parent CR
 		instance.Status.CloudKittyProcReadyCount = cloudKittyProc.Status.ReadyCount
@@ -1166,6 +1179,12 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		if c != nil {
 			instance.Status.Conditions.Set(c)
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.CloudKittyProcReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	err = mariadbv1.DeleteUnusedMariaDBAccountFinalizers(ctx, helper, cloudkitty.DatabaseName, instance.Spec.DatabaseAccount, instance.Namespace)
@@ -1189,6 +1208,25 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
 	}
 
+	// Deferred transport secret rotation cleanup for main transport
+	isTransportRotation := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
+
+	if isTransportRotation {
+		if instance.Status.Conditions.AllSubConditionIsTrue() {
+			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+				ctx, helper, instance.Namespace,
+				instance.Status.TransportURLSecret,
+				telemetryv1.TelemetryTransportConsumerFinalizer,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			instance.Status.TransportURLSecret = transportURL.Status.SecretName
+		}
+	} else {
+		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	}
+
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' successfully", instance.Name))
 	// update the overall status condition if service is ready
 	if instance.IsReady() {
@@ -1206,6 +1244,7 @@ func (r *CloudKittyReconciler) generateServiceConfigs(
 	serviceLabels map[string]string,
 	memcached *memcachedv1.Memcached,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 	//
@@ -1245,7 +1284,7 @@ func (r *CloudKittyReconciler) generateServiceConfigs(
 		return err
 	}
 
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return err
 	}
@@ -1458,12 +1497,12 @@ func (r *CloudKittyReconciler) transportURLCreateOrUpdate(
 	return transportURL, op, err
 }
 
-func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty) (*telemetryv1.CloudKittyAPI, controllerutil.OperationResult, error) {
+func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty, transportURLSecretName string) (*telemetryv1.CloudKittyAPI, controllerutil.OperationResult, error) {
 	cloudkittyAPISpec := telemetryv1.CloudKittyAPISpec{
 		CloudKittyTemplate:    instance.Spec.CloudKittyTemplate,
 		CloudKittyAPITemplate: instance.Spec.CloudKittyAPI,
 		DatabaseHostname:      instance.Status.DatabaseHostname,
-		TransportURLSecret:    instance.Status.TransportURLSecret,
+		TransportURLSecret:    transportURLSecretName,
 		ServiceAccount:        instance.RbacResourceName(),
 	}
 
@@ -1498,12 +1537,12 @@ func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, 
 	return deployment, op, err
 }
 
-func (r *CloudKittyReconciler) procDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty) (*telemetryv1.CloudKittyProc, controllerutil.OperationResult, error) {
+func (r *CloudKittyReconciler) procDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty, transportURLSecretName string) (*telemetryv1.CloudKittyProc, controllerutil.OperationResult, error) {
 	cloudKittyProcSpec := telemetryv1.CloudKittyProcSpec{
 		CloudKittyTemplate:     instance.Spec.CloudKittyTemplate,
 		CloudKittyProcTemplate: instance.Spec.CloudKittyProc,
 		DatabaseHostname:       instance.Status.DatabaseHostname,
-		TransportURLSecret:     instance.Status.TransportURLSecret,
+		TransportURLSecret:     transportURLSecretName,
 		ServiceAccount:         instance.RbacResourceName(),
 		//TLS:                    instance.Spec.CloudKittyProc.TLS.Ca,
 	}

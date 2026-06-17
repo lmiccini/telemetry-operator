@@ -362,10 +362,16 @@ func (r *AutoscalingReconciler) reconcileNormalAodh(
 
 	if sfset.GetStatefulSet().Generation == sfset.GetStatefulSet().Status.ObservedGeneration {
 		instance.Status.ReadyCount = sfset.GetStatefulSet().Status.ReadyReplicas
-		if instance.Status.ReadyCount > 0 {
+		if instance.Status.ReadyCount > 0 && sfset.GetStatefulSet().Status.UpdatedReplicas >= *sfset.GetStatefulSet().Spec.Replicas {
 			instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 		}
 		instance.Status.Networks = instance.Spec.Aodh.NetworkAttachmentDefinitions
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	//

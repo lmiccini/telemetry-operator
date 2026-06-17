@@ -281,6 +281,15 @@ func (r *AutoscalingReconciler) reconcileDelete(
 			return ctrl.Result{}, err
 		}
 	}
+	notifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		notifSecret = *instance.Status.NotificationsURLSecret
+	}
+	if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		notifSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Service is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(instance, helper.GetFinalizer())
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' delete successfully", autoscaling.ServiceName))
@@ -377,9 +386,7 @@ func (r *AutoscalingReconciler) reconcileNormal(
 		Log.Info(fmt.Sprintf("NotificationBusInstanceURL %s successfully reconciled - operation: %s", notificationBusInstanceURL.Name, string(op)))
 	}
 
-	instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
-
-	if instance.Status.NotificationsURLSecret == nil || *instance.Status.NotificationsURLSecret == "" {
+	if notificationBusInstanceURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for NotificationBusInstanceURL %s secret to be created", notificationBusInstanceURL.Name))
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.NotificationBusInstanceReadyCondition,
@@ -387,6 +394,14 @@ func (r *AutoscalingReconciler) reconcileNormal(
 			condition.SeverityInfo,
 			condition.NotificationBusInstanceReadyRunningMessage))
 		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
+	}
+
+	if err := rabbitmqv1.ManageTransportSecretFinalizer(
+		ctx, helper, instance.Namespace,
+		notificationBusInstanceURL.Status.SecretName,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+	); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	instance.Status.Conditions.MarkTrue(condition.NotificationBusInstanceReadyCondition, condition.NotificationBusInstanceReadyMessage)
@@ -508,7 +523,7 @@ func (r *AutoscalingReconciler) reconcileNormal(
 	// check for required NotificationsBus TransportURL secret holding transport URL string
 	// Aodh only uses NotificationsBus, not MessagingBus
 	//
-	if instance.Status.NotificationsURLSecret == nil || *instance.Status.NotificationsURLSecret == "" {
+	if notificationBusInstanceURL.Status.SecretName == "" {
 		Log.Info("NotificationsURLSecret not yet available")
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.NotificationBusInstanceReadyCondition,
@@ -529,7 +544,7 @@ func (r *AutoscalingReconciler) reconcileNormal(
 		ctx,
 		types.NamespacedName{
 			Namespace: instance.Namespace,
-			Name:      *instance.Status.NotificationsURLSecret,
+			Name:      notificationBusInstanceURL.Status.SecretName,
 		},
 		transportValidateFields,
 		helper.GetClient(),
@@ -610,7 +625,7 @@ func (r *AutoscalingReconciler) reconcileNormal(
 	// - %-scripts configmap holding scripts to e.g. bootstrap the service
 	// - %-config configmap holding minimal autoscaling config required to get the service up, user can add additional files to be added to the service
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars, memcached, db)
+	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars, memcached, db, notificationBusInstanceURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -745,6 +760,29 @@ func (r *AutoscalingReconciler) reconcileNormal(
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Aodh.Auth.ApplicationCredentialSecret
 	}
 
+	// Deferred transport secret rotation cleanup for notification transport
+	currentNotifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		currentNotifSecret = *instance.Status.NotificationsURLSecret
+	}
+	isNotificationRotation := currentNotifSecret != "" &&
+		currentNotifSecret != notificationBusInstanceURL.Status.SecretName
+
+	if isNotificationRotation {
+		if instance.Status.Conditions.AllSubConditionIsTrue() {
+			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
+				ctx, helper, instance.Namespace,
+				currentNotifSecret,
+				telemetryv1.TelemetryTransportConsumerFinalizer,
+			); err != nil {
+				return ctrl.Result{}, err
+			}
+			instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
+		}
+	} else {
+		instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
+	}
+
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
 		instance.Status.Conditions.MarkTrue(
 			condition.ReadyCondition, condition.ReadyMessage)
@@ -784,6 +822,7 @@ func (r *AutoscalingReconciler) generateServiceConfig(
 	envVars *map[string]env.Setter,
 	mc *memcachedv1.Memcached,
 	db *mariadbv1.Database,
+	notificationSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(autoscaling.ServiceName), map[string]string{})
@@ -814,12 +853,7 @@ func (r *AutoscalingReconciler) generateServiceConfig(
 		return err
 	}
 
-	// Ensure NotificationsURLSecret is not nil before dereferencing
-	if instance.Status.NotificationsURLSecret == nil {
-		return ErrNotificationsURLSecretNotSet
-	}
-
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, notificationSecretName, instance.Namespace)
 	if err != nil {
 		return err
 	}
@@ -903,8 +937,8 @@ func (r *AutoscalingReconciler) generateServiceConfig(
 
 	// Add NotificationsURL if configured
 	// Always get the separate notification secret since we always create separate TransportURLs
-	if instance.Status.NotificationsURLSecret != nil && *instance.Status.NotificationsURLSecret != "" {
-		notificationInstanceURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsURLSecret, instance.Namespace)
+	if notificationSecretName != "" {
+		notificationInstanceURLSecret, _, err := secret.GetSecret(ctx, h, notificationSecretName, instance.Namespace)
 		if err != nil {
 			return err
 		}
