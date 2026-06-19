@@ -765,23 +765,18 @@ func (r *AutoscalingReconciler) reconcileNormal(
 	if instance.Status.NotificationsURLSecret != nil {
 		currentNotifSecret = *instance.Status.NotificationsURLSecret
 	}
-	isNotificationRotation := currentNotifSecret != "" &&
-		currentNotifSecret != notificationBusInstanceURL.Status.SecretName
-
-	if isNotificationRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				currentNotifSecret,
-				telemetryv1.TelemetryTransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
-		}
-	} else {
-		instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
+	allSubCRsStable := op == controllerutil.OperationResultNone
+	secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		currentNotifSecret,
+		notificationBusInstanceURL.Status.SecretName,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+		allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.NotificationsURLSecret = &secretName
 
 	if instance.Status.Conditions.AllSubConditionIsTrue() {
 		instance.Status.Conditions.MarkTrue(

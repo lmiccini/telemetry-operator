@@ -871,7 +871,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	// create RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 	//
 
-	transportURL, op, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
+	transportURL, transportURLOp, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.RabbitMqTransportURLReadyCondition,
@@ -882,8 +882,8 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		return ctrl.Result{}, err
 	}
 
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
+	if transportURLOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(transportURLOp)))
 	}
 
 	if transportURL.Status.SecretName == "" {
@@ -1124,7 +1124,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	//
 
 	// deploy cloudkitty-api
-	cloudKittyAPI, op, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
+	cloudKittyAPI, apiOp, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyAPIReadyCondition,
@@ -1134,8 +1134,8 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("API CR for %s successfully %s", instance.Name, string(op)))
+	if apiOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("API CR for %s successfully %s", instance.Name, string(apiOp)))
 	}
 	if cloudKittyAPI.Generation == cloudKittyAPI.Status.ObservedGeneration {
 		// Mirror CloudKittyAPI status' APIEndpoints and ReadyCount to this parent CR
@@ -1157,7 +1157,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	}
 
 	// deploy CloudKitty Processor
-	cloudKittyProc, op, err := r.procDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
+	cloudKittyProc, procOp, err := r.procDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyProcReadyCondition,
@@ -1167,8 +1167,8 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("Scheduler CR for %s successfully %s", instance.Name, string(op)))
+	if procOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Scheduler CR for %s successfully %s", instance.Name, string(procOp)))
 	}
 	if cloudKittyProc.Generation == cloudKittyProc.Status.ObservedGeneration {
 		// Mirror CloudKitty Processor status' ReadyCount to this parent CR
@@ -1209,23 +1209,20 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	}
 
 	// Deferred transport secret rotation cleanup for main transport
-	isTransportRotation := instance.Status.TransportURLSecret != "" &&
-		instance.Status.TransportURLSecret != transportURL.Status.SecretName
-
-	if isTransportRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := rabbitmqv1.RemoveTransportSecretConsumerFinalizer(
-				ctx, helper, instance.Namespace,
-				instance.Status.TransportURLSecret,
-				telemetryv1.TelemetryTransportConsumerFinalizer,
-			); err != nil {
-				return ctrl.Result{}, err
-			}
-			instance.Status.TransportURLSecret = transportURL.Status.SecretName
-		}
-	} else {
-		instance.Status.TransportURLSecret = transportURL.Status.SecretName
+	allSubCRsStable := transportURLOp == controllerutil.OperationResultNone &&
+		apiOp == controllerutil.OperationResultNone &&
+		procOp == controllerutil.OperationResultNone
+	secretName, err := rabbitmqv1.FinalizeTransportSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		transportURL.Status.SecretName,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+		allSubCRsStable && instance.Status.Conditions.AllSubConditionIsTrue(),
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	instance.Status.TransportURLSecret = secretName
 
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' successfully", instance.Name))
 	// update the overall status condition if service is ready
