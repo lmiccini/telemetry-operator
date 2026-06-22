@@ -335,6 +335,7 @@ func main() {
 		Kclient:    kclient,
 		RESTMapper: mgr.GetRESTMapper(),
 		Cache:      mgr.GetCache(),
+		APIReader:  mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CloudKitty")
 		os.Exit(1)

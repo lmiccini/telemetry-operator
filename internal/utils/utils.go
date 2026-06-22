@@ -46,6 +46,7 @@ type ConditionalWatchingReconciler struct {
 	Watching   []string
 	RESTMapper meta.RESTMapper
 	Cache      cache.Cache
+	APIReader  client.Reader
 }
 
 // EnsureDeleted - Delete the object which in turn will clean the sub resources

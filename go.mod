@@ -65,8 +65,8 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/openshift/api v3.9.0+incompatible // indirect
-	github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.20260526114926-7ebfadd589db // indirect
-	github.com/openstack-k8s-operators/lib-common/modules/storage v0.6.1-0.20260526114926-7ebfadd589db // indirect
+	github.com/openstack-k8s-operators/lib-common/modules/openstack v0.6.1-0.20260610101308-d3778a549c89 // indirect
+	github.com/openstack-k8s-operators/lib-common/modules/storage v0.6.1-0.20260610101308-d3778a549c89 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -140,3 +140,9 @@ replace k8s.io/code-generator => k8s.io/code-generator v0.31.13 //allow-merging
 replace k8s.io/component-base => k8s.io/component-base v0.31.13 //allow-merging
 
 replace k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20250627150254-e9823e99808e //allow-merging
+
+replace github.com/openstack-k8s-operators/lib-common/modules/common => github.com/lmiccini/lib-common/modules/common v0.0.0-20260622102304-6eac5e449074
+
+replace github.com/openstack-k8s-operators/infra-operator/apis => github.com/lmiccini/infra-operator/apis v0.0.0-20260620072433-7bda5c00b68f
+
+replace github.com/openstack-k8s-operators/keystone-operator/api => github.com/lmiccini/keystone-operator/api v0.0.0-20260620073840-e242ef5877eb

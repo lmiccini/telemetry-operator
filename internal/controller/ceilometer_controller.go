@@ -50,6 +50,7 @@ import (
 	env "github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	helper "github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	labels "github.com/openstack-k8s-operators/lib-common/modules/common/labels"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	secret "github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	statefulset "github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
@@ -414,10 +415,19 @@ func (r *CeilometerReconciler) reconcileDelete(ctx context.Context, instance *te
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, ceilometer.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	notifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		notifSecret = *instance.Status.NotificationsURLSecret
+	}
+	if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		notifSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Service is deleted so remove the finalizer.
@@ -563,9 +573,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 		Log.Info(fmt.Sprintf("NotificationBusInstanceURL %s successfully reconciled - operation: %s", notificationBusInstanceURL.Name, string(op)))
 	}
 
-	instance.Status.NotificationsURLSecret = &notificationBusInstanceURL.Status.SecretName
-
-	if instance.Status.NotificationsURLSecret == nil || *instance.Status.NotificationsURLSecret == "" {
+	if notificationBusInstanceURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for NotificationBusInstanceURL %s secret to be created", notificationBusInstanceURL.Name))
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.NotificationBusInstanceReadyCondition,
@@ -574,6 +582,25 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 			condition.NotificationBusInstanceReadyRunningMessage))
 		return ctrl.Result{RequeueAfter: time.Duration(10) * time.Second}, nil
 	}
+
+	oldNotifSecret := ""
+	if instance.Status.NotificationsURLSecret != nil {
+		oldNotifSecret = *instance.Status.NotificationsURLSecret
+	}
+	currentNotifSecret := notificationBusInstanceURL.Status.SecretName
+
+	if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		currentNotifSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	notifRotationFinalized := false
+	instance.Status.NotificationsURLSecret = &currentNotifSecret
+	defer func() {
+		if !notifRotationFinalized {
+			instance.Status.NotificationsURLSecret = &oldNotifSecret
+		}
+	}()
 
 	instance.Status.Conditions.MarkTrue(condition.NotificationBusInstanceReadyCondition, condition.NotificationBusInstanceReadyMessage)
 	// end notificationsBus
@@ -688,7 +715,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	// - %-config configmap holding minimal ceilometer config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateServiceConfig(ctx, helper, instance, &configMapVars, notificationBusInstanceURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -705,7 +732,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	// - %-config configmap holding minimal ceilometer-compute config required to get the service up, user can add additional files to be added to the service
 	// - parameters which has passwords gets added from the OpenStack secret via the init container
 	//
-	err = r.generateComputeServiceConfig(ctx, helper, instance, &configMapVars)
+	err = r.generateComputeServiceConfig(ctx, helper, instance, &configMapVars, notificationBusInstanceURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -766,9 +793,8 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	// secret. Old secret finalizer removal is deferred until all
 	// sub-conditions are true (see late phase below).
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			ceilometer.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -845,14 +871,14 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 	if sfset.GetStatefulSet().Generation == sfset.GetStatefulSet().Status.ObservedGeneration {
 		instance.Status.ReadyCount = sfset.GetStatefulSet().Status.ReadyReplicas
 		instance.Status.Networks = instance.Spec.NetworkAttachmentDefinitions
-		svc, op, err := ceilometer.Service(instance, helper, ceilometer.CeilometerPrometheusPort, serviceLabels)
+		svc, svcOp, err := ceilometer.Service(instance, helper, ceilometer.CeilometerPrometheusPort, serviceLabels)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if op != controllerutil.OperationResultNone {
-			Log.Info(fmt.Sprintf(msgOperation, svc.Name, string(op)))
+		if svcOp != controllerutil.OperationResultNone {
+			Log.Info(fmt.Sprintf(msgOperation, svc.Name, string(svcOp)))
 		}
-		if instance.Status.ReadyCount > 0 {
+		if statefulset.IsReady(sfset.GetStatefulSet()) {
 			instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 		}
 		// Late phase of the AC split pattern: remove the old AC secret's
@@ -861,7 +887,7 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 			instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 		if isACRotation {
 			if instance.Status.Conditions.AllSubConditionIsTrue() {
-				if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+				if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 					instance.Status.ApplicationCredentialSecret, ceilometer.ACConsumerFinalizer); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -876,7 +902,29 @@ func (r *CeilometerReconciler) reconcileCeilometer(
 				condition.ReadyCondition, condition.ReadyMessage)
 		}
 		Log.Info(fmt.Sprintf(msgReconcileSuccess, ceilometer.ServiceName))
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			condition.DeploymentReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
+
+	guardReady := op == controllerutil.OperationResultNone &&
+		instance.Status.Conditions.AllSubConditionIsTrue()
+	secretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		oldNotifSecret,
+		currentNotifSecret,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.NotificationsURLSecret = &secretName
+	notifRotationFinalized = true
+
 	return ctrl.Result{}, nil
 }
 
@@ -1068,7 +1116,7 @@ func (r *CeilometerReconciler) reconcileMysqldExporter(
 		if op != controllerutil.OperationResultNone {
 			Log.Info(fmt.Sprintf(msgOperation, svc.Name, string(op)))
 		}
-		if instance.Status.MysqldExporterReadyCount > 0 {
+		if statefulset.IsReady(sfset.GetStatefulSet()) {
 			instance.Status.Conditions.MarkTrue(telemetryv1.MysqldExporterDeploymentReadyCondition, condition.DeploymentReadyMessage)
 		}
 		Log.Info(fmt.Sprintf(msgReconcileSuccess, mysqldexporter.ServiceName))
@@ -1239,7 +1287,7 @@ func (r *CeilometerReconciler) reconcileKSM(
 	ssobj := ss.GetStatefulSet()
 	if ssobj.Generation == ssobj.Status.ObservedGeneration {
 		instance.Status.KSMReadyCount = ss.GetStatefulSet().Status.ReadyReplicas
-		if instance.Status.KSMReadyCount > 0 {
+		if statefulset.IsReady(ss.GetStatefulSet()) {
 			instance.Status.Conditions.MarkTrue(telemetryv1.KSMDeploymentReadyCondition, condition.DeploymentReadyMessage)
 		}
 
@@ -1274,6 +1322,7 @@ func (r *CeilometerReconciler) generateServiceConfig(
 	h *helper.Helper,
 	instance *telemetryv1.Ceilometer,
 	envVars *map[string]env.Setter,
+	notificationSecretName string,
 ) error {
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(ceilometer.ServiceName), map[string]string{})
 	customData := map[string]string{common.CustomServiceConfigFileName: instance.Spec.CustomServiceConfig}
@@ -1289,12 +1338,7 @@ func (r *CeilometerReconciler) generateServiceConfig(
 		return err
 	}
 
-	// Ensure NotificationsURLSecret is not nil before dereferencing
-	if instance.Status.NotificationsURLSecret == nil {
-		return ErrNotificationsURLSecretNotSet
-	}
-
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, notificationSecretName, instance.Namespace)
 	if err != nil {
 		return err
 	}
@@ -1357,8 +1401,8 @@ func (r *CeilometerReconciler) generateServiceConfig(
 
 	// Add NotificationsURL if configured
 	// Always get the separate notification secret since we always create separate TransportURLs
-	if instance.Status.NotificationsURLSecret != nil && *instance.Status.NotificationsURLSecret != "" {
-		notificationInstanceURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsURLSecret, instance.Namespace)
+	if notificationSecretName != "" {
+		notificationInstanceURLSecret, _, err := secret.GetSecret(ctx, h, notificationSecretName, instance.Namespace)
 		if err != nil {
 			return err
 		}
@@ -1399,6 +1443,7 @@ func (r *CeilometerReconciler) generateComputeServiceConfig(
 	h *helper.Helper,
 	instance *telemetryv1.Ceilometer,
 	envVars *map[string]env.Setter,
+	notificationSecretName string,
 ) error {
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(ceilometer.ComputeServiceName), map[string]string{})
 	ipmiLabels := labels.GetLabels(instance, labels.GetGroupLabel(ceilometer.IpmiServiceName), map[string]string{})
@@ -1415,12 +1460,7 @@ func (r *CeilometerReconciler) generateComputeServiceConfig(
 		return err
 	}
 
-	// Ensure NotificationsURLSecret is not nil before dereferencing
-	if instance.Status.NotificationsURLSecret == nil {
-		return ErrNotificationsURLSecretNotSet
-	}
-
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, *instance.Status.NotificationsURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, notificationSecretName, instance.Namespace)
 	if err != nil {
 		return err
 	}

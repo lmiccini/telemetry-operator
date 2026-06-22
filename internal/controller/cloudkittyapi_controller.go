@@ -1130,7 +1130,7 @@ func (r *CloudKittyAPIReconciler) reconcileNormal(ctx context.Context, instance 
 		return ctrl.Result{}, err
 	}
 
-	if instance.Status.ReadyCount > 0 {
+	if statefulset.IsReady(ss.GetStatefulSet()) {
 		instance.Status.Conditions.MarkTrue(condition.DeploymentReadyCondition, condition.DeploymentReadyMessage)
 
 	} else if *instance.Spec.Replicas > 0 {

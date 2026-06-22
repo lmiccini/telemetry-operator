@@ -59,6 +59,7 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/job"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/object"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/secret"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
@@ -157,6 +158,7 @@ func (r *CloudKittyReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		Log.Error(err, fmt.Sprintf("could not instantiate helper for instance %s", instance.Name))
 		return ctrl.Result{}, err
 	}
+	helper.SetAPIReader(r.APIReader)
 
 	//
 	// initialize status
@@ -521,10 +523,15 @@ func (r *CloudKittyReconciler) reconcileDelete(ctx context.Context, instance *te
 		instance.Status.ApplicationCredentialSecret,
 		instance.Spec.Auth.ApplicationCredentialSecret,
 	} {
-		if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			secretName, cloudkitty.ACConsumerFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Service is deleted so remove the finalizer.
@@ -866,7 +873,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	// create RabbitMQ transportURL CR and get the actual URL from the associated secret that is created
 	//
 
-	transportURL, op, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
+	transportURL, transportURLOp, err := r.transportURLCreateOrUpdate(ctx, instance, serviceLabels)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.RabbitMqTransportURLReadyCondition,
@@ -877,13 +884,11 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		return ctrl.Result{}, err
 	}
 
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(op)))
+	if transportURLOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("TransportURL %s successfully reconciled - operation: %s", transportURL.Name, string(transportURLOp)))
 	}
 
-	instance.Status.TransportURLSecret = transportURL.Status.SecretName
-
-	if instance.Status.TransportURLSecret == "" {
+	if transportURL.Status.SecretName == "" {
 		Log.Info(fmt.Sprintf("Waiting for TransportURL %s secret to be created", transportURL.Name))
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.RabbitMqTransportURLReadyCondition,
@@ -891,6 +896,21 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			condition.SeverityInfo,
 			condition.RabbitMqTransportURLReadyRunningMessage))
 		return cloudkitty.ResultRequeue, nil
+	}
+
+	currentTransportSecret := transportURL.Status.SecretName
+
+	// Set status early for first-time setup so PatchInstance persists it
+	// even on early returns. During rotation (old != current), the status
+	// is only updated by FinalizeSecretRotation at end of reconcile.
+	if instance.Status.TransportURLSecret == "" ||
+		instance.Status.TransportURLSecret == currentTransportSecret {
+		instance.Status.TransportURLSecret = currentTransportSecret
+	}
+
+	if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		currentTransportSecret, telemetryv1.TelemetryTransportConsumerFinalizer); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	instance.Status.Conditions.MarkTrue(condition.RabbitMqTransportURLReadyCondition, condition.RabbitMqTransportURLReadyMessage)
@@ -1001,7 +1021,7 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	//
 	// Create Secrets required as input for the Service and calculate an overall hash of hashes
 	//
-	err = r.generateServiceConfigs(ctx, helper, instance, &configVars, serviceLabels, memcached, db)
+	err = r.generateServiceConfigs(ctx, helper, instance, &configVars, serviceLabels, memcached, db, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -1041,9 +1061,8 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	// secret. Old secret finalizer removal is deferred until all
 	// sub-conditions are true (see late phase below).
 	if instance.Spec.Auth.ApplicationCredentialSecret != "" {
-		if err := keystonev1.ManageACSecretFinalizer(ctx, helper, instance.Namespace,
+		if err := object.ManageSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 			instance.Spec.Auth.ApplicationCredentialSecret,
-			"",
 			cloudkitty.ACConsumerFinalizer); err != nil {
 			instance.Status.Conditions.Set(condition.FalseCondition(
 				condition.ServiceConfigReadyCondition,
@@ -1112,8 +1131,11 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	// normal reconcile tasks
 	//
 
+	rotationInProgress := instance.Status.TransportURLSecret != "" &&
+		instance.Status.TransportURLSecret != transportURL.Status.SecretName
+
 	// deploy cloudkitty-api
-	cloudKittyAPI, op, err := r.apiDeploymentCreateOrUpdate(ctx, instance)
+	cloudKittyAPI, apiOp, err := r.apiDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyAPIReadyCondition,
@@ -1123,11 +1145,12 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("API CR for %s successfully %s", instance.Name, string(op)))
+	if err := helper.EnsureFresh(ctx, apiOp, cloudKittyAPI, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	// Mirror values when the data in the StatefulSet is for the current generation
+	if apiOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("API CR for %s successfully %s", instance.Name, string(apiOp)))
+	}
 	if cloudKittyAPI.Generation == cloudKittyAPI.Status.ObservedGeneration {
 		// Mirror CloudKittyAPI status' APIEndpoints and ReadyCount to this parent CR
 		instance.Status.APIEndpoints = cloudKittyAPI.Status.APIEndpoints
@@ -1139,10 +1162,16 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		if c != nil {
 			instance.Status.Conditions.Set(c)
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.CloudKittyAPIReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	// deploy CloudKitty Processor
-	cloudKittyProc, op, err := r.procDeploymentCreateOrUpdate(ctx, instance)
+	cloudKittyProc, procOp, err := r.procDeploymentCreateOrUpdate(ctx, instance, transportURL.Status.SecretName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			telemetryv1.CloudKittyProcReadyCondition,
@@ -1152,11 +1181,12 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 			err.Error()))
 		return ctrl.Result{}, err
 	}
-	if op != controllerutil.OperationResultNone {
-		Log.Info(fmt.Sprintf("Scheduler CR for %s successfully %s", instance.Name, string(op)))
+	if err := helper.EnsureFresh(ctx, procOp, cloudKittyProc, rotationInProgress); err != nil {
+		return ctrl.Result{}, err
 	}
-
-	// Mirror values when the data in the StatefulSet is for the current generation
+	if procOp != controllerutil.OperationResultNone {
+		Log.Info(fmt.Sprintf("Scheduler CR for %s successfully %s", instance.Name, string(procOp)))
+	}
 	if cloudKittyProc.Generation == cloudKittyProc.Status.ObservedGeneration {
 		// Mirror CloudKitty Processor status' ReadyCount to this parent CR
 		instance.Status.CloudKittyProcReadyCount = cloudKittyProc.Status.ReadyCount
@@ -1166,6 +1196,12 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		if c != nil {
 			instance.Status.Conditions.Set(c)
 		}
+	} else {
+		instance.Status.Conditions.Set(condition.FalseCondition(
+			telemetryv1.CloudKittyProcReadyCondition,
+			condition.RequestedReason,
+			condition.SeverityInfo,
+			condition.DeploymentReadyRunningMessage))
 	}
 
 	err = mariadbv1.DeleteUnusedMariaDBAccountFinalizers(ctx, helper, cloudkitty.DatabaseName, instance.Spec.DatabaseAccount, instance.Namespace)
@@ -1173,13 +1209,26 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 		return ctrl.Result{}, err
 	}
 
+	allSubCRsStable := transportURLOp == controllerutil.OperationResultNone &&
+		apiOp == controllerutil.OperationResultNone &&
+		procOp == controllerutil.OperationResultNone
+
+	// When sub-CRs were just updated, their conditions haven't been
+	// persisted yet (PatchInstance race). Requeue to let them process
+	// before evaluating the rotation guard.
+	if !allSubCRsStable {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	guardReady := condition.CredentialRotationGuardReady(allSubCRsStable, &instance.Status.Conditions)
+
 	// Late phase of the AC split pattern: remove the old AC secret's
 	// finalizer and update status only after all sub-conditions are true.
 	isACRotation := instance.Status.ApplicationCredentialSecret != "" &&
 		instance.Status.ApplicationCredentialSecret != instance.Spec.Auth.ApplicationCredentialSecret
 	if isACRotation {
-		if instance.Status.Conditions.AllSubConditionIsTrue() {
-			if err := keystonev1.RemoveACSecretConsumerFinalizer(ctx, helper, instance.Namespace,
+		if guardReady {
+			if err := object.RemoveSecretConsumerFinalizer(ctx, helper, instance.Namespace,
 				instance.Status.ApplicationCredentialSecret, cloudkitty.ACConsumerFinalizer); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -1188,6 +1237,18 @@ func (r *CloudKittyReconciler) reconcileNormal(ctx context.Context, instance *te
 	} else {
 		instance.Status.ApplicationCredentialSecret = instance.Spec.Auth.ApplicationCredentialSecret
 	}
+
+	secretName, err := object.FinalizeSecretRotation(
+		ctx, helper, instance.Namespace,
+		instance.Status.TransportURLSecret,
+		currentTransportSecret,
+		telemetryv1.TelemetryTransportConsumerFinalizer,
+		guardReady,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	instance.Status.TransportURLSecret = secretName
 
 	Log.Info(fmt.Sprintf("Reconciled Service '%s' successfully", instance.Name))
 	// update the overall status condition if service is ready
@@ -1206,6 +1267,7 @@ func (r *CloudKittyReconciler) generateServiceConfigs(
 	serviceLabels map[string]string,
 	memcached *memcachedv1.Memcached,
 	db *mariadbv1.Database,
+	transportURLSecretName string,
 ) error {
 	Log := r.GetLogger(ctx)
 	//
@@ -1245,7 +1307,7 @@ func (r *CloudKittyReconciler) generateServiceConfigs(
 		return err
 	}
 
-	transportURLSecret, _, err := secret.GetSecret(ctx, h, instance.Status.TransportURLSecret, instance.Namespace)
+	transportURLSecret, _, err := secret.GetSecret(ctx, h, transportURLSecretName, instance.Namespace)
 	if err != nil {
 		return err
 	}
@@ -1458,12 +1520,12 @@ func (r *CloudKittyReconciler) transportURLCreateOrUpdate(
 	return transportURL, op, err
 }
 
-func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty) (*telemetryv1.CloudKittyAPI, controllerutil.OperationResult, error) {
+func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty, transportURLSecretName string) (*telemetryv1.CloudKittyAPI, controllerutil.OperationResult, error) {
 	cloudkittyAPISpec := telemetryv1.CloudKittyAPISpec{
 		CloudKittyTemplate:    instance.Spec.CloudKittyTemplate,
 		CloudKittyAPITemplate: instance.Spec.CloudKittyAPI,
 		DatabaseHostname:      instance.Status.DatabaseHostname,
-		TransportURLSecret:    instance.Status.TransportURLSecret,
+		TransportURLSecret:    transportURLSecretName,
 		ServiceAccount:        instance.RbacResourceName(),
 	}
 
@@ -1486,6 +1548,10 @@ func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, 
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.Spec = cloudkittyAPISpec
+		if deployment.Annotations == nil {
+			deployment.Annotations = map[string]string{}
+		}
+		deployment.Annotations["openstack.org/transport-url-secret"] = transportURLSecretName
 
 		err := controllerutil.SetControllerReference(instance, deployment, r.Scheme)
 		if err != nil {
@@ -1498,12 +1564,12 @@ func (r *CloudKittyReconciler) apiDeploymentCreateOrUpdate(ctx context.Context, 
 	return deployment, op, err
 }
 
-func (r *CloudKittyReconciler) procDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty) (*telemetryv1.CloudKittyProc, controllerutil.OperationResult, error) {
+func (r *CloudKittyReconciler) procDeploymentCreateOrUpdate(ctx context.Context, instance *telemetryv1.CloudKitty, transportURLSecretName string) (*telemetryv1.CloudKittyProc, controllerutil.OperationResult, error) {
 	cloudKittyProcSpec := telemetryv1.CloudKittyProcSpec{
 		CloudKittyTemplate:     instance.Spec.CloudKittyTemplate,
 		CloudKittyProcTemplate: instance.Spec.CloudKittyProc,
 		DatabaseHostname:       instance.Status.DatabaseHostname,
-		TransportURLSecret:     instance.Status.TransportURLSecret,
+		TransportURLSecret:     transportURLSecretName,
 		ServiceAccount:         instance.RbacResourceName(),
 		//TLS:                    instance.Spec.CloudKittyProc.TLS.Ca,
 	}
@@ -1527,6 +1593,10 @@ func (r *CloudKittyReconciler) procDeploymentCreateOrUpdate(ctx context.Context,
 
 	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
 		deployment.Spec = cloudKittyProcSpec
+		if deployment.Annotations == nil {
+			deployment.Annotations = map[string]string{}
+		}
+		deployment.Annotations["openstack.org/transport-url-secret"] = transportURLSecretName
 
 		err := controllerutil.SetControllerReference(instance, deployment, r.Scheme)
 		if err != nil {
